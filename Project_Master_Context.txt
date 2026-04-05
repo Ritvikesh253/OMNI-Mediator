@@ -1,0 +1,88 @@
+Gemini said
+We are officially ready to build.
+
+Here is your updated, exhibition-ready Master Context Document. It includes the original architecture plus all the critical resilience, asynchronous execution, and timeout fixes identified by the deep research.
+
+Copy the text below, save it as Project_Master_Context.txt, and feed it to your coding AI. When you're ready, tell me: "Let's build Phase 1."
+
+MASTER ARCHITECTURAL BLUEPRINT: THE OMNI-MEDIATOR LOCAL AI BRIDGE (V2 - RESILIENT EDITION)
+1. THE CORE IDEA & PROJECT VISION
+This project is an Agentic Middleware Platform. We are solving the "Hardware Gap" by bridging a lightweight mobile interface (Telegram) to a high-compute local machine (16GB Mac/Windows laptop). The user sends natural language commands from their phone. The Mediator (our Python platform) intercepts these messages, routes them to the OS kernel or a local LLM (Ollama), and returns the results.
+
+The ultimate goal is 100% remote control of local compute, with 100% data privacy, protected by an air-gapped human-in-the-loop security layer, and engineered to survive unstable live exhibition environments.
+
+2. SYSTEM ARCHITECTURE
+The system is divided into four distinct components:
+
+The Client (The Interface): A Telegram Bot on the user's mobile device.
+
+The Mediator (The Nerve System): A single Python script running locally on the laptop. It utilizes python-telegram-bot for asynchronous polling.
+
+The Brain (The Agent): A local LLM running via Ollama (e.g., Llama 3) for offline semantic processing.
+
+The Body (The OS): The laptop's operating system, controlled via Python's subprocess library.
+
+3. CORE FEATURES & RESILIENCE REQUIREMENTS
+
+Feature A: The "Zero-Touch" OpenClaw-Style Setup Wizard
+
+What it does: A random user runs ONE command in their terminal. The script takes over and does not stop until the Telegram bot is fully linked and tested.
+
+The Exact Setup Sequence:
+
+Dependency Download: Silently installs python-telegram-bot, requests, and psutil via pip.
+
+Token Prompt: Pauses and asks the terminal: "Enter your Telegram Bot Token:"
+
+Ollama Auto-Test: The script automatically pings http://localhost:11434. It sends a test prompt to ensure Ollama is running a model. If it fails, it pauses and tells the user to start Ollama.
+
+Permission Prompt: The script asks the user in the terminal: "Do you want to give this bot permission to run Terminal/OS commands? (Y/N)". This choice is saved. If 'N', the Sentinel Shell is completely disabled, and the bot acts only as a text-to-text AI.
+
+Final Handshake: Once everything passes, the Python script uses the Token to automatically send a message to the user's Telegram phone app saying: "✅ Setup Complete! Your local AI is connected. You can now chat with me."
+
+
+Feature B: The Intent Router (Asynchronous)
+
+The Mediator uses rule-based filtering to save compute and latency:
+
+Quick Checks: Status commands (RAM/CPU) bypass the AI and return instantly.
+
+OS Commands: Keywords like "open" trigger OS-specific actions (subprocess.run(["open", path]) for Mac).
+
+Complex Queries: Unrecognized text is sent to http://localhost:11434/api/generate.
+
+CRITICAL ASYNC REQUIREMENT: All heavy tasks (Subprocess execution and Ollama HTTP requests) MUST be offloaded using asyncio.get_event_loop().run_in_executor() so the Telegram bot never blocks or freezes while waiting for a response.
+
+Feature C: The "Sentinel Shell" (Human-In-The-Loop Security)
+
+The Allow-List: The code must contain a strict list of safe commands (e.g., ls, pwd, df -h, top, uptime, python3, say).
+
+The Verification Loop: If a terminal command is requested, execution halts. The bot sends a Telegram message with Inline Keyboard Buttons: [✅ Allow] and [❌ Deny]. It only executes if "Allow" is tapped.
+
+Execution Guardrails: Every subprocess.run() call MUST include shell=False and a strict timeout=30 parameter to prevent infinite hangs.
+
+Feature D: Exhibition-Grade Error Handling (The "Fail-Fast" Protocol)
+
+Network Drops: The Telegram application must have a global error_handler attached to catch telegram.error.TimedOut exceptions silently so the bot survives Wi-Fi drops without crashing.
+
+Ollama Offline States: All requests.post() calls to Ollama MUST be wrapped in a try...except block with a timeout=10 parameter. If Ollama is closed, the bot gracefully replies: "⚠️ Local Agent Offline: Please ensure Ollama is running."
+
+4. STRICT ENGINEERING GUIDELINES
+NO Root/Admin Access: The script MUST explicitly block any command starting with sudo, su, or rm -rf.
+
+Platform Agnosticism: Detect the OS (platform.system()) to dynamically switch between Mac (open) and Windows (os.startfile) commands.
+
+No Hardcoded User Paths: Use os.path.expanduser("~/Desktop") instead of explicit paths like /Users/name/Desktop.
+
+No Blocking Operations in Main Loop: A hanging command or a slow LLM generation must NEVER deafen the Telegram listener.
+
+5. DEVELOPMENT PHASES
+When writing the code, break the development down into these four phases. Do not write the whole script at once. Wait for my prompt to proceed to each phase.
+
+Phase 1: Build the Zero-Touch Bootstrap shell, configuration loader, and basic asynchronous Telegram polling skeleton.
+
+Phase 2: Build the local OS control logic (status checks, opening files) wrapped in async executors with subprocess timeouts.
+
+Phase 3: Integrate the local Ollama API bridge with requests timeouts and graceful error handling.
+
+Phase 4: Build the "Sentinel Shell" (Inline Button Authorization) and the Global Error Handler for network drops.
