@@ -155,9 +155,10 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 # ── Ollama ──
 OLLAMA_API_URL          = "http://localhost:11434/api/generate"
+OLLAMA_CHAT_URL         = "http://localhost:11434/api/chat"
 TELEGRAM_API_BASE       = "https://api.telegram.org"
 OLLAMA_TEST_TIMEOUT     = 5    # seconds — fail fast during FTUX
-OLLAMA_GENERATE_TIMEOUT = 10   # seconds — strict cap on LLM generation requests
+OLLAMA_GENERATE_TIMEOUT = 45   # seconds — laptop CPUs need breathing room
 OLLAMA_MODEL            = "llama3.2:3b"  # Fast local model for testing
 
 # ── Platform ──
@@ -178,7 +179,12 @@ ALLOWED_COMMANDS = {
 
 # ── Sentinel Shell: Blocked Prefixes ──
 # These are UNCONDITIONALLY rejected — no prompt, no override, no exceptions.
-BLOCKED_PREFIXES = ("sudo ", "su ", "rm -rf", "sudo", "su")
+# NOTE: Only space-suffixed prefixes to avoid false positives (e.g. "sudoers").
+BLOCKED_PREFIXES = ("sudo ", "su ", "rm -rf ")
+
+# ── Sentinel Shell: Sensitive Path Patterns ──
+# Block cat/head/tail from reading private keys, credentials, etc.
+SENSITIVE_PATTERNS = [".ssh", ".gnupg", "/proc", "config.json", ".env", "id_rsa", ".aws"]
 
 # ── Intent Router: Quick-Check Keywords ──
 # Messages matching these trigger instant psutil-based responses, bypassing AI.
@@ -547,7 +553,7 @@ async def run_blocking(func, *args, **kwargs):
     """
     Offload a blocking function to the default thread-pool executor.
 
-    This wraps asyncio.get_event_loop().run_in_executor() with a cleaner
+    This wraps asyncio.get_running_loop().run_in_executor() with a cleaner
     interface. The Telegram polling loop continues processing other messages
     while this function runs in a background thread.
 
@@ -559,7 +565,7 @@ async def run_blocking(func, *args, **kwargs):
     Returns:
         Whatever func() returns.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     # functools.partial lets us pass kwargs through run_in_executor
     return await loop.run_in_executor(
         None,  # Use the default ThreadPoolExecutor
@@ -648,6 +654,125 @@ def query_ollama(user_text: str) -> str:
 
 
 # =============================================================================
+# SECTION 7b: MEMORY MANAGER — Contextual Awareness
+# =============================================================================
+# Stores per-user conversation history so the AI remembers recent context.
+# Uses /api/chat (multi-turn) instead of /api/generate (single-shot).
+# =============================================================================
+
+class MemoryManager:
+    """
+    Per-user conversation memory with a rolling window.
+
+    Stores the last MAX_TURNS exchanges (user + assistant) so the LLM
+    can reference earlier messages in the same session. Memory is
+    ephemeral — clearing on script restart is by design.
+    """
+    MAX_TURNS = 10  # Keep last 10 exchanges (20 messages total)
+
+    def __init__(self):
+        self._history: dict[int, list[dict]] = {}  # user_id → [messages]
+
+    def get_history(self, user_id: int) -> list[dict]:
+        """Return the conversation history for a user."""
+        return self._history.get(user_id, [])
+
+    def add_user_message(self, user_id: int, content: str) -> None:
+        """Append a user message and trim to MAX_TURNS."""
+        self._history.setdefault(user_id, []).append(
+            {"role": "user", "content": content}
+        )
+        self._trim(user_id)
+
+    def add_assistant_message(self, user_id: int, content: str) -> None:
+        """Append an assistant message and trim to MAX_TURNS."""
+        self._history.setdefault(user_id, []).append(
+            {"role": "assistant", "content": content}
+        )
+        self._trim(user_id)
+
+    def clear(self, user_id: int) -> None:
+        """Wipe conversation history for a user."""
+        self._history.pop(user_id, None)
+
+    def _trim(self, user_id: int) -> None:
+        """Keep only the last MAX_TURNS * 2 messages (user + assistant pairs)."""
+        msgs = self._history.get(user_id, [])
+        max_msgs = self.MAX_TURNS * 2
+        if len(msgs) > max_msgs:
+            self._history[user_id] = msgs[-max_msgs:]
+
+
+# Global memory instance — ephemeral, resets on script restart
+memory = MemoryManager()
+
+
+def query_ollama_chat(user_text: str, user_id: int) -> str:
+    """
+    Send a message to Ollama's /api/chat endpoint with conversation history.
+
+    This gives the AI contextual awareness — it remembers what was said
+    earlier in the conversation. The history is managed by MemoryManager.
+    """
+    # Add the new user message to history
+    memory.add_user_message(user_id, user_text)
+
+    # Build the messages payload with full history
+    messages = memory.get_history(user_id)
+
+    try:
+        response = requests.post(
+            OLLAMA_CHAT_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": False,
+            },
+            timeout=OLLAMA_GENERATE_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        generated = data.get("message", {}).get("content", "").strip()
+
+        if not generated:
+            return (
+                "⚠️ The AI returned an empty response.\n"
+                "Try rephrasing your question or check if the model is loaded."
+            )
+
+        # Save the assistant's reply to memory
+        memory.add_assistant_message(user_id, generated)
+        return generated
+
+    except requests.exceptions.Timeout:
+        return (
+            "⚠️ *Local Agent Timeout:* The request to Ollama took too long "
+            "to process. Try a shorter or simpler prompt."
+        )
+
+    except requests.exceptions.ConnectionError:
+        return (
+            "⚠️ *Local Agent Offline:* Could not connect to the Ollama service.\n"
+            "Is it running? Start it with: `ollama serve`"
+        )
+
+    except requests.exceptions.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response else "unknown"
+        return (
+            f"⚠️ *Ollama Error (HTTP {status_code}):* "
+            f"The model may not be available. Try: `ollama pull {OLLAMA_MODEL}`"
+        )
+
+    except Exception as exc:
+        print(f"⚠️  Unexpected Ollama chat error: {type(exc).__name__}: {exc}")
+        return (
+            "⚠️ *Unexpected Error:* Something went wrong while contacting "
+            "the local AI. Check the terminal for details."
+        )
+
+
+# =============================================================================
 # SECTION 8: SYSTEM STATUS CHECKS (psutil — instant, no AI needed)
 # =============================================================================
 # These are the "Quick Checks" from the Intent Router specification.
@@ -688,7 +813,6 @@ def _get_system_status() -> str:
         battery_str = "N/A (no battery detected)"
 
     # ── Uptime ──
-    import time
     boot_time = psutil.boot_time()
     uptime_seconds = time.time() - boot_time
     uptime_hours = int(uptime_seconds // 3600)
@@ -798,6 +922,11 @@ def _execute_shell_command(command_str: str) -> str:
     Returns:
         Formatted output string for the Telegram response.
     """
+    # ── Sensitive path check ──
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern in command_str:
+            return "🚫 Access Denied: Path contains sensitive system data."
+
     try:
         # shlex.split safely tokenizes the command — respects quotes
         raw_args = shlex.split(command_str)
@@ -997,6 +1126,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/start`  — Verify connection handshake\n"
         "`/status` — Live system status (CPU, RAM, Disk, Battery)\n"
         "`/help`   — This help message\n"
+        "`/reset`  — Clear AI conversation memory\n"
         "\n"
         "*Natural Language (just type):*\n"
         '• `"status"` / `"ram"` / `"cpu"` — Quick system check\n'
@@ -1022,10 +1152,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text += (
         "\n*AI Chat:*\n"
         "Any other message is forwarded to your local Ollama LLM.\n"
-        f"Model: `{OLLAMA_MODEL}` | Timeout: `{OLLAMA_GENERATE_TIMEOUT}s`"
+        f"Model: `{OLLAMA_MODEL}` | Timeout: `{OLLAMA_GENERATE_TIMEOUT}s`\n"
+        "The AI remembers your last 10 exchanges. Use `/reset` to clear."
     )
 
     await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handler for /reset — clears the AI conversation memory for this user.
+    """
+    if await _reject_if_unauthorized(update, context):
+        return
+
+    user_id = update.effective_user.id
+    memory.clear(user_id)
+    print(f"🧹 Memory cleared for user {update.effective_user.first_name} (ID: {user_id})")
+
+    await update.message.reply_text(
+        "🧹 *Memory Cleared*\n\n"
+        "Your AI conversation history has been wiped.\n"
+        "The next message starts a fresh context.",
+        parse_mode="Markdown",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1058,29 +1208,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if intent == "status":
         # Quick check — offload psutil to executor
         print(f"   → Intent: STATUS (quick check)")
-        report = await run_blocking(_get_system_status)
+        try:
+            report = await asyncio.wait_for(run_blocking(_get_system_status), timeout=15.0)
+        except asyncio.TimeoutError:
+            report = "⚠️ System status check timed out."
         await update.message.reply_text(report, parse_mode="Markdown")
 
     elif intent == "os_open":
-        # Open file/folder/app — offload subprocess to executor
-        print(f"   → Intent: OS_OPEN → {payload}")
-        result = await run_blocking(_open_target, payload)
-        await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+        # Open file/folder/app — gated behind inline approval like shell commands
+        print(f"   → Intent: OS_OPEN → Awaiting approval for: {payload}")
+
+        cmd_id = str(uuid.uuid4())[:8]
+        context.user_data.setdefault('pending_commands', {})[cmd_id] = {
+            "command": payload,
+            "timestamp": time.time(),
+            "type": "os_open",
+        }
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Allow", callback_data=f"exec_{cmd_id}"),
+                InlineKeyboardButton("❌ Deny",  callback_data=f"deny_{cmd_id}"),
+            ]
+        ])
+
+        await update.message.reply_text(
+            f"🛡️ <b>Sentinel Shell — Authorization Required</b>\n\n"
+            f"Action: Open <code>{html.escape(payload)}</code>\n\n"
+            f"Do you want to execute this on your machine?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
 
     elif intent == "shell":
         # ── SENTINEL SHELL: Human-in-the-loop verification ──
-        # Instead of executing immediately, we present the command to the
-        # user with [✅ Allow] and [❌ Deny] inline keyboard buttons.
-        # The command ONLY executes if the user taps Allow.
         print(f"   → Intent: SHELL → Awaiting approval for: {payload}")
 
-        # Store the pending command in context.user_data so the callback
-        # handler can retrieve it when the button is tapped.
         cmd_id = str(uuid.uuid4())[:8]
-        context.user_data.setdefault('pending_commands', {})[cmd_id] = payload
+        context.user_data.setdefault('pending_commands', {})[cmd_id] = {
+            "command": payload,
+            "timestamp": time.time(),
+            "type": "shell",
+        }
 
-        # Build the inline keyboard with Allow / Deny buttons.
-        # Callback data is prefixed with "exec_" and "deny_" for routing.
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Allow", callback_data=f"exec_{cmd_id}"),
@@ -1116,38 +1286,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
     elif intent == "ai":
-        # Forward to Ollama — the full AI bridge
+        # Forward to Ollama — the full AI bridge with memory
         print(f"   → Intent: AI → Ollama ({OLLAMA_MODEL})")
 
-        # Send a "thinking" placeholder immediately so the user knows
-        # their message was received. The Telegram UI will show this
-        # while the LLM generates in the background.
         thinking_msg = await update.message.reply_text(
             "🧠 _Consulting Local Agent (this might take a moment)..._",
             parse_mode="Markdown",
         )
 
-        # Offload the blocking HTTP request to a thread executor.
-        # The Telegram polling loop continues handling other messages
-        # while Ollama generates the response.
-        ai_response = await run_blocking(query_ollama, text)
+        user_id = update.effective_user.id
 
-        # Edit the placeholder message with the actual AI response.
-        # This gives a clean UX — the "thinking" message transforms
-        # into the answer in-place.
+        try:
+            ai_response = await asyncio.wait_for(
+                run_blocking(query_ollama_chat, text, user_id),
+                timeout=50.0,
+            )
+        except asyncio.TimeoutError:
+            ai_response = "⚠️ The AI took too long to respond. Please try a simpler prompt."
+
         try:
             await thinking_msg.edit_text(
                 ai_response,
                 parse_mode="Markdown",
             )
         except Exception:
-            # If edit fails (e.g., Markdown parse error in AI response),
-            # fall back to sending a plain-text message instead.
             try:
                 await thinking_msg.edit_text(ai_response)
             except Exception:
-                # Last resort: send as a new message (edit can fail if
-                # the message is identical or too old)
                 await update.message.reply_text(ai_response)
 
 
@@ -1186,43 +1351,69 @@ async def callback_sentinel_shell(update: Update, context: ContextTypes.DEFAULT_
         
     action, cmd_id = callback_data.split("_", 1)
 
-    if action == "exec":
-        # ── USER APPROVED: Execute the command ──
-        pending_cmd = context.user_data.get("pending_commands", {}).pop(cmd_id, None)
+    # Retrieve the pending entry (dict with command, timestamp, type)
+    pending_entry = context.user_data.get("pending_commands", {}).pop(cmd_id, None)
 
-        if not pending_cmd:
+    if action == "exec":
+        # ── USER APPROVED ──
+        if not pending_entry:
             await query.edit_message_text(
                 "⚠️ No pending command found. It may have expired.\n"
                 "Please send the command again."
             )
             return
 
-        print(f"🛡️ Sentinel Shell: ALLOWED → {pending_cmd}")
+        # ── TTL Check: 60-second expiry ──
+        cmd_text = pending_entry["command"]
+        cmd_type = pending_entry.get("type", "shell")
+        elapsed = time.time() - pending_entry["timestamp"]
 
-        # Update the authorization message to show it was approved
+        if elapsed > 60:
+            await query.edit_message_text(
+                "⏰ <b>Request Expired</b>\n\n"
+                f"Command: <code>{html.escape(cmd_text)}</code>\n\n"
+                "This authorization request is older than 60 seconds.\n"
+                "Please send the command again for a fresh approval.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        print(f"🛡️ Sentinel Shell: ALLOWED → {cmd_text}")
+
         await query.edit_message_text(
             f"🛡️ <b>Sentinel Shell — Approved ✅</b>\n\n"
-            f"Command: <code>{html.escape(pending_cmd)}</code>\n\n"
+            f"Command: <code>{html.escape(cmd_text)}</code>\n\n"
             f"⏳ <i>Executing...</i>",
             parse_mode=ParseMode.HTML,
         )
 
-        # Execute the command via the async executor — never blocks polling
-        result = await run_blocking(_execute_shell_command, pending_cmd)
+        # Route to the correct executor based on command type
+        if cmd_type == "os_open":
+            try:
+                result = await asyncio.wait_for(
+                    run_blocking(_open_target, cmd_text), timeout=35.0
+                )
+            except asyncio.TimeoutError:
+                result = "⚠️ Open command timed out."
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    run_blocking(_execute_shell_command, cmd_text), timeout=35.0
+                )
+            except asyncio.TimeoutError:
+                result = "⚠️ Command execution timed out."
 
-        # Send the result as a new message (the authorization message stays
-        # as a record of approval)
         await query.message.reply_text(result, parse_mode=ParseMode.HTML)
 
     elif action == "deny":
-        # ── USER DENIED: Discard the command ──
-        denied_cmd = context.user_data.get("pending_commands", {}).pop(cmd_id, "(unknown)")
+        # ── USER DENIED ──
+        cmd_text = pending_entry["command"] if pending_entry else "(unknown)"
 
-        print(f"🛡️ Sentinel Shell: DENIED → {denied_cmd}")
+        print(f"🛡️ Sentinel Shell: DENIED → {cmd_text}")
 
         await query.edit_message_text(
             f"🛡️ <b>Sentinel Shell — Denied ❌</b>\n\n"
-            f"Command: <code>{html.escape(denied_cmd)}</code>\n\n"
+            f"Command: <code>{html.escape(cmd_text)}</code>\n\n"
             f"The command was not executed.",
             parse_mode=ParseMode.HTML,
         )
@@ -1313,9 +1504,10 @@ def main() -> None:
     app.bot_data["config"] = config
 
     # ── Register command handlers ──
-    app.add_handler(CommandHandler("start", cmd_start))     # /start — handshake
+    app.add_handler(CommandHandler("start", cmd_start))     # /start  — handshake
     app.add_handler(CommandHandler("status", cmd_status))   # /status — system info
     app.add_handler(CommandHandler("help", cmd_help))       # /help   — command ref
+    app.add_handler(CommandHandler("reset", cmd_reset))     # /reset  — clear AI memory
 
     # ── Register the Sentinel Shell callback handler ──
     # This processes inline button taps (✅ Allow / ❌ Deny) from the
